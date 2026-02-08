@@ -1,0 +1,38 @@
+name: Deploy to Azure App Service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'flask_app/**'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        working-directory: flask_app
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Zip artifact
+        working-directory: flask_app
+        run: zip -r ../deploy.zip . -x "*.pyc" "__pycache__/*" "uploads/*" "*.db"
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: deploy.zip
+          startup-command: 'gunicorn --bind=0.0.0.0:8000 --timeout 600 --workers 2 app:app'
