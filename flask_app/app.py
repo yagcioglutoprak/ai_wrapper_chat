@@ -13,6 +13,7 @@ Environment variables (see .env.example):
     SECRET_KEY                        — Flask secret key
 """
 
+import os
 from datetime import datetime, timezone
 
 from flask import (
@@ -336,8 +337,18 @@ def file_delete(file_id):
 # ── API Endpoints (JSON) ─────────────────────────────────────────────────────
 
 
-@app.route("/api/conversations", methods=["GET"])
+@app.route("/api/conversations", methods=["GET", "POST"])
 def api_conversations():
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        conv = Conversation(
+            title=data.get("title", "API Conversation"),
+            model=data.get("model", "claude-opus-4-6"),
+            status=data.get("status", "active"),
+        )
+        db.session.add(conv)
+        db.session.commit()
+        return jsonify(conv.to_dict()), 201
     convos = Conversation.query.order_by(Conversation.updated_at.desc()).all()
     return jsonify([c.to_dict() for c in convos])
 
@@ -348,6 +359,22 @@ def api_conversation(conv_id):
     data = conv.to_dict()
     data["messages"] = [m.to_dict() for m in conv.messages]
     return jsonify(data)
+
+
+@app.route("/api/conversations/<int:conv_id>/messages", methods=["POST"])
+def api_message_create(conv_id):
+    conv = Conversation.query.get_or_404(conv_id)
+    data = request.get_json(silent=True) or {}
+    msg = Message(
+        conversation_id=conv.id,
+        role=data.get("role", "user"),
+        content=data.get("content", ""),
+        token_count=data.get("token_count", 0),
+    )
+    db.session.add(msg)
+    conv.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify(msg.to_dict()), 201
 
 
 @app.route("/api/prompts", methods=["GET"])
@@ -394,4 +421,5 @@ def health():
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port, debug=True)

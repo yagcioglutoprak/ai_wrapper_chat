@@ -169,7 +169,96 @@ MAX_MESSAGES = 40
 
 RATE_LIMIT_DEFAULT_COOLDOWN = 60  # seconds
 
+FLASK_API_URL = os.environ.get("FLASK_API_URL", "http://127.0.0.1:5001")
+
 import threading
+import urllib.request
+import urllib.error
+
+
+def _log_conversation(req: "MessagesRequest", response_text: str, response_tool_uses: list = None):
+    """Log the conversation (user message + assistant response) to the Flask dashboard DB."""
+    try:
+        user_preview = ""
+        for msg in reversed(req.messages):
+            role = msg.role if hasattr(msg, "role") else msg.get("role", "")
+            if role == "user":
+                content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+                if isinstance(content, str):
+                    user_preview = content[:200]
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            user_preview = block.get("text", "")[:200]
+                            break
+                break
+
+        title = user_preview[:80] or "API Conversation"
+        if len(user_preview) > 80:
+            title += "..."
+
+        conv_data = json.dumps({
+            "title": title,
+            "model": req.model,
+        }).encode("utf-8")
+        conv_req = urllib.request.Request(
+            f"{FLASK_API_URL}/api/conversations",
+            data=conv_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        conv_resp = urllib.request.urlopen(conv_req, timeout=5)
+        conv = json.loads(conv_resp.read())
+        conv_id = conv["id"]
+
+        if user_preview:
+            msg_data = json.dumps({
+                "role": "user",
+                "content": user_preview,
+                "token_count": len(user_preview) // 4,
+            }).encode("utf-8")
+            msg_req = urllib.request.Request(
+                f"{FLASK_API_URL}/api/conversations/{conv_id}/messages",
+                data=msg_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(msg_req, timeout=5)
+
+        if response_text:
+            assistant_content = response_text[:5000]
+            msg_data = json.dumps({
+                "role": "assistant",
+                "content": assistant_content,
+                "token_count": len(assistant_content) // 4,
+            }).encode("utf-8")
+            msg_req = urllib.request.Request(
+                f"{FLASK_API_URL}/api/conversations/{conv_id}/messages",
+                data=msg_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(msg_req, timeout=5)
+
+        if response_tool_uses:
+            for tu in response_tool_uses:
+                tool_content = f"[Tool: {tu.get('name', '?')}] {json.dumps(tu.get('input', {}))[:500]}"
+                msg_data = json.dumps({
+                    "role": "assistant",
+                    "content": tool_content,
+                    "token_count": len(tool_content) // 4,
+                }).encode("utf-8")
+                msg_req = urllib.request.Request(
+                    f"{FLASK_API_URL}/api/conversations/{conv_id}/messages",
+                    data=msg_data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(msg_req, timeout=5)
+
+        print(f"[DASHBOARD] Logged conversation {conv_id}: {title[:50]}")
+    except Exception as e:
+        print(f"[DASHBOARD] Could not log conversation: {e}")
 
 _rate_limit_lock = threading.Lock()
 _rate_limit_state = {"active": False, "until": 0.0}
@@ -1091,6 +1180,28 @@ async def messages(req: MessagesRequest):
                     )
             yield b"\n"
 
+            # Log conversation to Flask dashboard (background, non-blocking)
+            if status_code == 200:
+                try:
+                    log_raw = raw if not stream_started else b""
+                    if stream_started and os.path.exists(stream_path.replace(".stream", ".raw")):
+                        pass
+                    parsed = json.loads(_sse_to_messages_response(raw))
+                    resp_text = ""
+                    resp_tools = []
+                    for block in parsed.get("content", []):
+                        if block.get("type") == "text":
+                            resp_text += block.get("text", "")
+                        elif block.get("type") == "tool_use":
+                            resp_tools.append(block)
+                    threading.Thread(
+                        target=_log_conversation,
+                        args=(req, resp_text, resp_tools),
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    pass
+
             # Clean up stream files
             for p in (stream_path, done_path):
                 try:
@@ -1148,6 +1259,25 @@ async def messages(req: MessagesRequest):
                 "Retry-After": str(int(retry_after or RATE_LIMIT_DEFAULT_COOLDOWN))
             },
         )
+
+    # Log conversation to Flask dashboard (background, non-blocking)
+    if status_code == 200:
+        try:
+            parsed = json.loads(_sse_to_messages_response(raw))
+            resp_text = ""
+            resp_tools = []
+            for block in parsed.get("content", []):
+                if block.get("type") == "text":
+                    resp_text += block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    resp_tools.append(block)
+            threading.Thread(
+                target=_log_conversation,
+                args=(req, resp_text, resp_tools),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
 
     request_id = uuid.uuid4().hex[:16]
     return Response(
