@@ -18,6 +18,7 @@ raw_responses/
 amp_queue/
 amp_raw_responses/
 captures/
+amp-intercept/
 cli.lock
 relay_response.jsonl
 prompt_history
