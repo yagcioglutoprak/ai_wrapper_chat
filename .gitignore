@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Runtime data (regenerated at runtime)
+sessions/
+logs/*.log
+queue/
+raw_responses/
+amp_queue/
+amp_raw_responses/
+captures/
+cli.lock
+relay_response.jsonl
+prompt_history
+
+# Flask app runtime
+flask_app/uploads/
+flask_app/*.db
+flask_app/instance/
+
+# Logs
+*.log
+mitm.log
+server.log
+
+# Debug / temp artifacts
+/tmp/debug_*.json
+*.tmp
+*.bak
+*.bak2
+
+# Azure deploy
+deploy.zip
+
+# Secrets (never commit)
+.env
