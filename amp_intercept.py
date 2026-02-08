@@ -15,30 +15,25 @@ Prerequisites:
 This script intercepts Amp CLI requests to:
     ampcode.com/api/provider/anthropic/v1/messages
 
-And forwards the body to localhost:8000/v1/messages (rovodev_server),
-which spawns `acli rovodev run` with proper Atlassian auth.
+And rewrites the destination to localhost:8000/v1/messages (rovodev_server),
+letting mitmproxy handle streaming natively for true SSE pass-through.
 """
 
-import asyncio
 import gzip
 import json
 import os
 import time
-import urllib.request
-import urllib.error
-from http.client import IncompleteRead
-from concurrent.futures import ThreadPoolExecutor
+import threading
 from mitmproxy import http
-from mitmproxy import ctx
-
-_executor = ThreadPoolExecutor(max_workers=4)
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 AMP_API_URL = "ampcode.com/api/provider/anthropic/v1/messages"
-ROVODEV_SERVER = "http://127.0.0.1:8000/v1/messages"
+ROVODEV_HOST = "127.0.0.1"
+ROVODEV_PORT = 8000
+ROVODEV_PATH = "/v1/messages"
 LOG_FILE = "/Users/toprakyagcioglu/.rovodev/logs/amp_proxy.log"
 TRACK_FILE = "/Users/toprakyagcioglu/.rovodev/amp-intercept/amp_all_requests.log"
 
@@ -98,41 +93,70 @@ def _zero_tokens_and_costs(obj, depth=0) -> bool:
     return changed
 
 
-def _zero_sse_usage(data: bytes) -> bytes:
-    """Zero out usage/token counts in SSE response events."""
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    out = []
-    for line in lines:
-        if line.strip().startswith("data: "):
-            data_str = line.strip()[6:]
-            try:
-                evt = json.loads(data_str)
-                if _zero_tokens_and_costs(evt):
-                    line = f"data: {json.dumps(evt)}"
-            except (json.JSONDecodeError, TypeError):
-                pass
-        out.append(line)
-    return "\n".join(out).encode("utf-8")
+# =============================================================================
+# SSE STREAMING TRANSFORMER — zeroes usage in-flight without buffering
+# =============================================================================
+
+class SSEUsageZeroer:
+    """Line-buffered SSE transformer that zeroes token/cost fields in-flight.
+
+    Assigned to flow.response.stream so mitmproxy calls it for each chunk.
+    Works with arbitrary chunk boundaries (chunks may split mid-line).
+    """
+
+    def __init__(self):
+        self._buf = ""
+
+    def __call__(self, chunk: bytes) -> bytes:
+        if not chunk:
+            remaining = self._flush()
+            return remaining if remaining else b""
+
+        self._buf += chunk.decode("utf-8", errors="replace")
+        out = []
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            stripped = line.strip()
+            if stripped.startswith("data: "):
+                data_str = stripped[6:]
+                try:
+                    evt = json.loads(data_str)
+                    if _zero_tokens_and_costs(evt):
+                        line = f"data: {json.dumps(evt)}"
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            out.append(line + "\n")
+        return "".join(out).encode("utf-8") if out else b""
+
+    def _flush(self) -> bytes:
+        if self._buf.strip():
+            result = self._buf + "\n"
+            self._buf = ""
+            return result.encode("utf-8")
+        self._buf = ""
+        return b""
 
 
 def log_request(flow: http.HTTPFlow, label: str) -> None:
-    with open(LOG_FILE, "a") as f:
-        f.write(f"\n{'=' * 80}\n")
-        f.write(f"{label} - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"URL: {flow.request.pretty_url}\n")
-        f.write(f"Method: {flow.request.method}\n")
-        f.write(f"Headers:\n")
-        for header, value in flow.request.headers.items():
-            if header.lower() in ["authorization", "x-api-key"]:
-                f.write(f"  {header}: [REDACTED]\n")
-            else:
-                f.write(f"  {header}: {value}\n")
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"\n{'=' * 80}\n")
+            f.write(f"{label} - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"URL: {flow.request.pretty_url}\n")
+            f.write(f"Method: {flow.request.method}\n")
+            f.write(f"Headers:\n")
+            for header, value in flow.request.headers.items():
+                if header.lower() in ["authorization", "x-api-key"]:
+                    f.write(f"  {header}: [REDACTED]\n")
+                else:
+                    f.write(f"  {header}: {value}\n")
+    except Exception:
+        pass
 
 
-async def request(flow: http.HTTPFlow) -> None:
-    """Intercept Amp CLI requests and forward to rovodev_server."""
+def request(flow: http.HTTPFlow) -> None:
+    """Intercept Amp CLI requests and rewrite destination to rovodev_server."""
 
-    # Zero out token/cost data in telemetry, uploadThread, costInfo requests
     url = flow.request.pretty_url
     ct = flow.request.headers.get("content-type", "")
     if "json" in ct and any(ep in url for ep in INTERCEPT_URLS):
@@ -170,7 +194,6 @@ async def request(flow: http.HTTPFlow) -> None:
         has_thinking = "thinking" in data
         max_tokens = data.get("max_tokens", "?")
 
-        # --- Extract user message preview ---
         user_preview = ""
         for msg in reversed(data.get("messages", [])):
             if msg.get("role") == "user":
@@ -184,73 +207,55 @@ async def request(flow: http.HTTPFlow) -> None:
                     user_preview = c[:200]
                 break
 
-        # --- Track ALL requests to log file ---
         ts = time.strftime("%Y%m%d_%H%M%S")
-        track_entry = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "model": model,
-            "stream": is_streaming,
-            "messages": msg_count,
-            "tools": tool_count,
-            "system_chars": sys_len,
-            "body_bytes": body_size,
-            "max_tokens": max_tokens,
-            "thinking": has_thinking,
-            "user_preview": user_preview.replace("\n", "\\n"),
-        }
         track_line = (
-            f"[{track_entry['timestamp']}] "
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
             f"model={model} | msgs={msg_count} | tools={tool_count} | "
             f"sys={sys_len}ch | body={body_size}B | max_tokens={max_tokens} | "
             f"stream={is_streaming} | thinking={has_thinking}\n"
             f"  -> user: {user_preview[:150].replace(chr(10), ' ')}\n"
         )
-        with open(TRACK_FILE, "a") as tf:
-            tf.write(f"\n{'=' * 80}\n")
-            tf.write(track_line)
+        try:
+            os.makedirs(os.path.dirname(TRACK_FILE), exist_ok=True)
+            with open(TRACK_FILE, "a") as tf:
+                tf.write(f"\n{'=' * 80}\n")
+                tf.write(track_line)
+        except Exception:
+            pass
 
         print(f"[AMP-TRACK] {model} | msgs={msg_count} | tools={tool_count} | body={body_size}B | max_tokens={max_tokens}")
         print(f"[AMP-TRACK] user_preview: {user_preview[:100].replace(chr(10), ' ')}")
 
-        # --- Save full request body to per-request JSON ---
         amp_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amp-intercept", "logs")
-        os.makedirs(amp_log_dir, exist_ok=True)
-        model_tag = model.split("-")[1] if "-" in model else model
-        with open(os.path.join(amp_log_dir, f"amp_{model_tag}_{ts}.json"), "w") as _f:
-            json.dump(data, _f, indent=2)
-        with open("/tmp/amp_original_request.json", "w") as _f:
-            json.dump(data, _f, indent=2)
-        print(f"[AMP] Saved full request to amp-intercept/logs/amp_{model_tag}_{ts}.json")
+        try:
+            os.makedirs(amp_log_dir, exist_ok=True)
+            model_tag = model.split("-")[1] if "-" in model else model
+            with open(os.path.join(amp_log_dir, f"amp_{model_tag}_{ts}.json"), "w") as _f:
+                json.dump(data, _f, indent=2)
+            print(f"[AMP] Saved full request to amp-intercept/logs/amp_{model_tag}_{ts}.json")
+        except Exception:
+            pass
 
-        # --- If Haiku: log it but let it pass through to real Amp API (don't block) ---
         if "haiku" in model.lower():
-            print(f"[AMP-TRACK] HAIKU request logged — passing through to ampcode.com (not intercepting)")
-            with open(TRACK_FILE, "a") as tf:
-                tf.write(f"  >> ACTION: PASS-THROUGH (Haiku goes to real Amp API)\n")
+            print(f"[AMP-TRACK] HAIKU request logged — passing through to ampcode.com")
             return
 
         print(f"[AMP] Intercepting non-Haiku request: {flow.request.pretty_url}")
         log_request(flow, "AMP REQUEST")
         print(f"[AMP] Model: {model}, messages: {msg_count}, stream: {is_streaming}")
 
-        # --- Modify request to match Bedrock compatibility ---
-        # Remove thinking (Bedrock gateway rejects it)
         if "thinking" in data:
             print(f"[AMP] Removing thinking: {data['thinking']}")
             del data["thinking"]
 
-        # Remove stream (handled by Bedrock endpoint selection)
         if "stream" in data:
-            print(f"[AMP] Removing stream: {data['stream']}")
             del data["stream"]
 
-        # Force max_tokens to 8192
         original_max = data.get("max_tokens")
         data["max_tokens"] = 8192
         if original_max != 8192:
             print(f"[AMP] max_tokens: {original_max} -> 8192")
 
-        # Append Atlassian MCP tools (remove existing first, then add at end)
         _atlassian_tools = [
             {
                 "name": "mcp__atlassian__get_tool_schema",
@@ -295,7 +300,6 @@ async def request(flow: http.HTTPFlow) -> None:
                 "cache_control": {"type": "ephemeral"}
             }
         ]
-        # Remove any existing MCP tools, then append fresh ones at the end
         tools = data.get("tools", [])
         tools[:] = [t for t in tools if t.get("name") not in {"mcp__atlassian__get_tool_schema", "mcp__atlassian__invoke_tool"}]
         tools.extend(_atlassian_tools)
@@ -303,80 +307,22 @@ async def request(flow: http.HTTPFlow) -> None:
         print(f"[AMP] Added Atlassian MCP tools (total tools: {len(tools)})")
 
         body_bytes = json.dumps(data).encode("utf-8")
-        req = urllib.request.Request(
-            ROVODEV_SERVER,
-            data=body_bytes,
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream" if is_streaming else "application/json",
-            },
-            method="POST",
-        )
+        flow.request.set_content(body_bytes)
 
-        print(f"[AMP] Forwarding to rovodev_server ({ROVODEV_SERVER})...")
+        flow.request.headers.pop("accept-encoding", None)
+        flow.request.headers.pop("content-encoding", None)
+        flow.request.headers["content-type"] = "application/json"
+        flow.request.headers["accept"] = "text/event-stream"
+        flow.request.headers["content-length"] = str(len(body_bytes))
 
-        def _do_forward(req):
-            resp = urllib.request.urlopen(req, timeout=660)
-            status = resp.status
-            content_type = resp.headers.get("Content-Type", "text/event-stream")
-            chunks = []
-            try:
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-            except IncompleteRead as e:
-                chunks.append(e.partial)
-                print(f"[AMP] IncompleteRead — using {sum(len(c) for c in chunks)} bytes received so far")
-            return status, content_type, b"".join(chunks)
+        flow.request.scheme = "http"
+        flow.request.host = ROVODEV_HOST
+        flow.request.port = ROVODEV_PORT
+        flow.request.path = ROVODEV_PATH
+        flow.request.headers["host"] = f"{ROVODEV_HOST}:{ROVODEV_PORT}"
 
-        try:
-            loop = asyncio.get_event_loop()
-            status, content_type, response_data = await loop.run_in_executor(
-                _executor, _do_forward, req
-            )
-
-            print(f"[AMP] Got response: status={status}, size={len(response_data)}, type={content_type}")
-
-            response_data = _zero_sse_usage(response_data)
-
-            flow.response = http.Response.make(
-                status,
-                response_data,
-                {
-                    "Content-Type": content_type,
-                    "Cache-Control": "no-cache, no-store",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            print(f"[AMP ERROR] rovodev_server returned {e.code}: {error_body[:500]}")
-
-            with open(LOG_FILE, "a") as f:
-                f.write(f"\n[ERROR] rovodev_server {e.code}: {error_body[:500]}\n")
-
-            flow.response = http.Response.make(
-                e.code,
-                error_body.encode("utf-8"),
-                {"Content-Type": "application/json"},
-            )
-        except urllib.error.URLError as e:
-            error_msg = f"Cannot connect to rovodev_server at {ROVODEV_SERVER}: {e.reason}"
-            print(f"[AMP ERROR] {error_msg}")
-            flow.response = http.Response.make(
-                502,
-                json.dumps({
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": error_msg,
-                    },
-                }).encode("utf-8"),
-                {"Content-Type": "application/json"},
-            )
+        flow._amp_intercepted = True
+        print(f"[AMP] Rewrote destination to http://{ROVODEV_HOST}:{ROVODEV_PORT}{ROVODEV_PATH} (streaming pass-through)")
 
     except Exception as e:
         import traceback
@@ -395,10 +341,22 @@ async def request(flow: http.HTTPFlow) -> None:
         )
 
 
-def response(flow: http.HTTPFlow) -> None:
-    """Log responses for debugging."""
-    if AMP_API_URL not in flow.request.pretty_url:
+def responseheaders(flow: http.HTTPFlow) -> None:
+    """Enable streaming for intercepted responses — no buffering."""
+    if not getattr(flow, "_amp_intercepted", False):
         return
 
     if flow.response:
-        print(f"[AMP] Response status: {flow.response.status_code}, size: {len(flow.response.content or b'')} bytes")
+        flow.response.stream = SSEUsageZeroer()
+        print(f"[AMP] Streaming response with usage zeroing (status={flow.response.status_code})")
+
+
+def response(flow: http.HTTPFlow) -> None:
+    """Log responses for debugging."""
+    if not getattr(flow, "_amp_intercepted", False):
+        if AMP_API_URL not in flow.request.pretty_url:
+            return
+
+    if flow.response:
+        size = len(flow.response.content or b"") if not getattr(flow, "_amp_intercepted", False) else "streamed"
+        print(f"[AMP] Response status: {flow.response.status_code}, size: {size}")
