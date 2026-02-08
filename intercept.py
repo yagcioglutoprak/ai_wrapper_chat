@@ -794,7 +794,9 @@ def modify_opus_request(flow: http.HTTPFlow, label: str) -> None:
                 #             _deep_strip_cache_control(item)
                 #
                 # _deep_strip_cache_control(data)
-                print(f"[{label}] RELAY: cache_control is being preserved for prompt caching")
+                print(
+                    f"[{label}] RELAY: cache_control is being preserved for prompt caching"
+                )
 
                 print(
                     f"[{label}] RELAY: Using client data — "
@@ -809,7 +811,9 @@ def modify_opus_request(flow: http.HTTPFlow, label: str) -> None:
                 )
 
                 # Preserve cache_control with ttl for prompt caching
-                print(f"[{label}] RELAY: Preserving cache_control (1h TTL) for prompt caching")
+                print(
+                    f"[{label}] RELAY: Preserving cache_control (1h TTL) for prompt caching"
+                )
 
                 # Merge original RovoDev tools into relay tools.
                 # The Atlassian gateway REQUIRES standard RovoDev tool names
@@ -980,7 +984,9 @@ def modify_opus_request(flow: http.HTTPFlow, label: str) -> None:
                     t["cache_control"] = _1h_cache
             if tools:
                 tools[-1]["cache_control"] = _1h_cache
-            print(f"[{label}] RELAY: Keeping client tools ({len(tools)}) — all cache_control set to 1h")
+            print(
+                f"[{label}] RELAY: Keeping client tools ({len(tools)}) — all cache_control set to 1h"
+            )
 
             # Keep full Amp system prompt as-is, force 1h cache_control
             sys_blocks = data.get("system")
@@ -998,12 +1004,6 @@ def modify_opus_request(flow: http.HTTPFlow, label: str) -> None:
                     for blk in c:
                         if isinstance(blk, dict) and "cache_control" in blk:
                             blk["cache_control"] = _1h_cache
-            if msgs:
-                last_msg = msgs[-1]
-                content_blocks = last_msg.get("content")
-                if isinstance(content_blocks, list) and content_blocks:
-                    content_blocks[-1]["cache_control"] = _1h_cache
-
             print(
                 f"[{label}] RELAY: Tools={len(data.get('tools', []))}, cache_control set"
             )
