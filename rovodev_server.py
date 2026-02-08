@@ -165,7 +165,7 @@ RATE_LIMIT_FILE = os.path.expanduser("~/.rovodev/queue/rate_limit.json")
 
 # Maximum messages to keep.  We try to preserve tool_use/tool_result pairs
 # at the truncation boundary.
-MAX_MESSAGES = 40
+MAX_MESSAGES = 100  # threshold is 130, cut 30 → keep 100
 
 RATE_LIMIT_DEFAULT_COOLDOWN = 60  # seconds
 
@@ -390,14 +390,15 @@ def _normalize_system(system: Any) -> Optional[list]:
 # ---------------------------------------------------------------------------
 
 
-def _truncate_messages(messages: list, limit: int) -> list:
-    """Truncate to the last *limit* messages while keeping tool pairs intact.
+def _truncate_messages(messages: list, limit: int, threshold: int = 130) -> list:
+    """Truncate to the last *limit* messages when total exceeds *threshold*.
 
-    Strategy: take the last `limit` messages, then walk the start forward
+    Strategy: only truncate when messages exceed threshold (130). When cutting,
+    keep the last `limit` (100) messages, then walk the start forward
     until we land on a user message that has NO tool_result blocks (a clean
     conversational boundary). This guarantees we never start mid-tool-exchange.
     """
-    if len(messages) <= limit:
+    if len(messages) <= threshold:
         return messages
 
     start_idx = max(0, len(messages) - limit)
@@ -423,12 +424,22 @@ def _truncate_messages(messages: list, limit: int) -> list:
         start_idx += 1
 
     if start_idx >= len(messages):
-        # Fallback: walk backward from the end to find ANY user message
-        start_idx = len(messages) - 1
-        while start_idx >= 0 and messages[start_idx].get("role") != "user":
+        # Fallback: walk backward from original start to find a clean user message
+        start_idx = max(0, len(messages) - limit)
+        while start_idx > 0:
             start_idx -= 1
-        if start_idx < 0:
-            start_idx = 0  # Should never happen (conversation always starts with user)
+            msg = messages[start_idx]
+            if msg.get("role") == "user":
+                content = msg.get("content", [])
+                has_tool_results = isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                )
+                if not has_tool_results:
+                    break
+        # If still no clean boundary, just use the last few messages
+        if start_idx <= 0:
+            start_idx = max(0, len(messages) - 4)
 
     result = messages[start_idx:]
 
@@ -622,19 +633,23 @@ def _build_anthropic_body(req: MessagesRequest) -> dict:
     # Remove tool_choice — Bedrock gateway returns 403 with it
     body.pop("tool_choice", None)
 
-    # Remove thinking — disabled for now
-    body.pop("thinking", None)
+    # Pass through adaptive thinking if present, remove other thinking configs
+    if isinstance(body.get("thinking"), dict) and body["thinking"].get("type") == "adaptive":
+        pass  # Keep adaptive thinking
+    else:
+        body.pop("thinking", None)
 
-    # Strip cache_control from entire body (Bedrock doesn't support prompt caching)
-    def _strip_cache_control(obj):
-        if isinstance(obj, dict):
-            obj.pop("cache_control", None)
-            for v in obj.values():
-                _strip_cache_control(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                _strip_cache_control(item)
-    _strip_cache_control(body)
+    # Strip thinking/redacted_thinking content blocks from assistant messages
+    for msg in body.get("messages", []):
+        content = msg.get("content")
+        if isinstance(content, list):
+            msg["content"] = [
+                b for b in content
+                if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))
+            ]
+
+    # Keep cache_control — Bedrock supports prompt caching
+    print(f"[DEBUG] Preserving cache_control for prompt caching")
 
     # Add required anthropic_version for Bedrock
     body["anthropic_version"] = "bedrock-2023-05-31"
@@ -758,41 +773,39 @@ def _run_and_capture(
 
     proc = None
     try:
-        with _cli_lock(timeout=DEFAULT_TIMEOUT):
-            proc = subprocess.Popen(
-                cmd,
-                env=env,
-                cwd=os.getcwd(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,  # Close stdin so acli doesn't wait for interactive input
-            )
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            cwd=os.getcwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
 
-            deadline = time.monotonic() + DEFAULT_TIMEOUT
-            while time.monotonic() < deadline:
-                if os.path.exists(meta_path):
-                    break
+        deadline = time.monotonic() + DEFAULT_TIMEOUT
+        while time.monotonic() < deadline:
+            if os.path.exists(meta_path):
+                break
 
-                rc = proc.poll()
-                if rc is not None:
-                    # CLI finished — wait for intercept.py to flush the captured response
-                    for _ in range(12000):  # up to 10 minutes
-                        if os.path.exists(meta_path):
-                            break
-                        time.sleep(0.05)
+            rc = proc.poll()
+            if rc is not None:
+                for _ in range(12000):  # up to 10 minutes
                     if os.path.exists(meta_path):
                         break
-                    stdout = (proc.stdout.read() or b"").decode(errors="replace")[:500]
-                    stderr = (proc.stderr.read() or b"").decode(errors="replace")[:500]
-                    raise RuntimeError(
-                        f"CLI exited (code {rc}) before response was captured. "
-                        f"stdout: {stdout}. stderr: {stderr}"
-                    )
+                    time.sleep(0.05)
+                if os.path.exists(meta_path):
+                    break
+                stdout = (proc.stdout.read() or b"").decode(errors="replace")[:500]
+                stderr = (proc.stderr.read() or b"").decode(errors="replace")[:500]
+                raise RuntimeError(
+                    f"CLI exited (code {rc}) before response was captured. "
+                    f"stdout: {stdout}. stderr: {stderr}"
+                )
 
-                time.sleep(POLL_INTERVAL)
+            time.sleep(POLL_INTERVAL)
 
-            if not os.path.exists(meta_path):
-                raise TimeoutError(f"No response captured after {DEFAULT_TIMEOUT}s")
+        if not os.path.exists(meta_path):
+            raise TimeoutError(f"No response captured after {DEFAULT_TIMEOUT}s")
 
         # Read captured response
         with open(meta_path, "r") as f:

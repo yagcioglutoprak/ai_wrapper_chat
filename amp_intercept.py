@@ -186,6 +186,27 @@ def request(flow: http.HTTPFlow) -> None:
         data = json.loads(content.decode("utf-8"))
 
         model = data.get("model", "")
+
+        # === ONE-SHOT CONVERSATION INJECTION (skip Haiku) ===
+        if "haiku" not in model.lower():
+            inject_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue", "inject_messages.json")
+            if os.path.exists(inject_file):
+                try:
+                    with open(inject_file, "r") as _inf:
+                        old_msgs = json.load(_inf)
+                    new_user_msg = None
+                    for msg in reversed(data.get("messages", [])):
+                        if msg.get("role") == "user":
+                            new_user_msg = msg
+                            break
+                    if new_user_msg and old_msgs:
+                        data["messages"] = old_msgs + [new_user_msg]
+                        print(f"[AMP-INJECT] Restored {len(old_msgs)} old msgs + 1 new user msg = {len(data['messages'])} total")
+                    os.remove(inject_file)
+                    print(f"[AMP-INJECT] Deleted inject file (one-shot done)")
+                except Exception as _e:
+                    print(f"[AMP-INJECT ERROR] {_e}")
+        # === END INJECTION ===
         is_streaming = data.get("stream", True)
         msg_count = len(data.get("messages", []))
         tool_count = len(data.get("tools", []))
@@ -244,9 +265,42 @@ def request(flow: http.HTTPFlow) -> None:
         log_request(flow, "AMP REQUEST")
         print(f"[AMP] Model: {model}, messages: {msg_count}, stream: {is_streaming}")
 
+        # === FORBID ROVODEV/ATLASSIAN TOOLS VIA SYSTEM PROMPT ===
+        _forbidden_tools_instruction = (
+            "\n\n<CRITICAL_TOOL_RESTRICTION>\n"
+            "The following tools exist in your tool list for technical reasons ONLY. "
+            "You MUST NEVER call or attempt to use them under ANY circumstances. "
+            "They are non-functional placeholders required by the platform — calling them will cause errors:\n"
+            "- mcp__atlassian__get_tool_schema\n"
+            "- mcp__atlassian__invoke_tool\n"
+            "- open_files\n"
+            "- delete_file\n"
+            "- move_file\n"
+            "- expand_code_chunks\n"
+            "- find_and_replace_code\n"
+            "- expand_folder\n"
+            "- bash (use Bash instead)\n"
+            "- grep (use Grep instead)\n"
+            "- ask_user_questions\n"
+            "- exit_plan_mode\n"
+            "- update_todo\n"
+            "NEVER generate tool_use blocks for ANY of these tools. "
+            "Use only the standard Amp tools (Bash, Read, edit_file, create_file, Grep, glob, finder, Task, etc.).\n"
+            "</CRITICAL_TOOL_RESTRICTION>"
+        )
+        system = data.get("system", "")
+        if isinstance(system, str):
+            data["system"] = system + _forbidden_tools_instruction
+        elif isinstance(system, list):
+            data["system"] = system + [{"type": "text", "text": _forbidden_tools_instruction}]
+        else:
+            data["system"] = _forbidden_tools_instruction
+        print(f"[AMP] Injected forbidden-tools instruction into system prompt")
+
         if "thinking" in data:
-            print(f"[AMP] Removing thinking: {data['thinking']}")
-            del data["thinking"]
+            original_thinking = data["thinking"]
+            data["thinking"] = {"type": "adaptive"}
+            print(f"[AMP] Replaced thinking {original_thinking} -> adaptive")
 
         if "stream" in data:
             del data["stream"]
@@ -297,7 +351,7 @@ def request(flow: http.HTTPFlow) -> None:
                     "required": ["tool_name"],
                     "type": "object"
                 },
-                "cache_control": {"type": "ephemeral"}
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
             }
         ]
         tools = data.get("tools", [])
@@ -305,6 +359,57 @@ def request(flow: http.HTTPFlow) -> None:
         tools.extend(_atlassian_tools)
         data["tools"] = tools
         print(f"[AMP] Added Atlassian MCP tools (total tools: {len(tools)})")
+
+        # =================================================================
+        # PROMPT CACHING — add cache_control breakpoints
+        # Order: tools (already has it on last atlassian tool) → system → messages
+        # =================================================================
+        _cache_marker = {"type": "ephemeral", "ttl": "1h"}
+
+        # --- Strip any existing cache_control from Amp's original request ---
+        # (Amp adds its own, but they'd conflict with our placement)
+        for t in data.get("tools", []):
+            if isinstance(t, dict) and t.get("name") != "mcp__atlassian__invoke_tool":
+                t.pop("cache_control", None)
+        sys_blocks = data.get("system")
+        if isinstance(sys_blocks, list):
+            for sb in sys_blocks:
+                if isinstance(sb, dict):
+                    sb.pop("cache_control", None)
+        for msg in data.get("messages", []):
+            c = msg.get("content")
+            if isinstance(c, list):
+                for blk in c:
+                    if isinstance(blk, dict):
+                        blk.pop("cache_control", None)
+
+        # Breakpoint 2: Last system prompt block
+        sys_prompt = data.get("system")
+        if isinstance(sys_prompt, list) and sys_prompt:
+            sys_prompt[-1]["cache_control"] = _cache_marker
+            print(f"[AMP-CACHE] Added cache_control to system[-1]")
+        elif isinstance(sys_prompt, str) and sys_prompt:
+            data["system"] = [{"type": "text", "text": sys_prompt, "cache_control": _cache_marker}]
+            print(f"[AMP-CACHE] Converted system to list with cache_control")
+
+        # Breakpoint 3: Last content block of second-to-last message
+        # (caches full conversation history; only the final user msg is uncached)
+        messages = data.get("messages", [])
+        if len(messages) >= 2:
+            target_msg = messages[-2]
+            tc = target_msg.get("content")
+            if isinstance(tc, list) and tc:
+                tc[-1]["cache_control"] = _cache_marker
+            elif isinstance(tc, str):
+                target_msg["content"] = [{"type": "text", "text": tc, "cache_control": _cache_marker}]
+            print(f"[AMP-CACHE] Added cache_control to messages[-2] (conversation history)")
+
+        cache_points = sum(1 for t in data.get("tools", []) if isinstance(t, dict) and "cache_control" in t)
+        if isinstance(data.get("system"), list):
+            cache_points += sum(1 for s in data["system"] if isinstance(s, dict) and "cache_control" in s)
+        msg_cache = sum(1 for m in messages for blk in (m.get("content") if isinstance(m.get("content"), list) else []) if isinstance(blk, dict) and "cache_control" in blk)
+        cache_points += msg_cache
+        print(f"[AMP-CACHE] Total cache breakpoints: {cache_points} (tools/system/messages)")
 
         body_bytes = json.dumps(data).encode("utf-8")
         flow.request.set_content(body_bytes)

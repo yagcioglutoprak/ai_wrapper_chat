@@ -770,6 +770,7 @@ def modify_opus_request(flow: http.HTTPFlow, label: str) -> None:
                     "top_p",
                     "top_k",
                     "stop_sequences",
+                    "thinking",
                 }
                 _removed_keys = []
                 for k in list(data.keys()):
@@ -782,16 +783,18 @@ def modify_opus_request(flow: http.HTTPFlow, label: str) -> None:
                     )
 
                 # Deep-strip cache_control everywhere (Bedrock rejects it)
-                def _deep_strip_cache_control(obj):
-                    if isinstance(obj, dict):
-                        obj.pop("cache_control", None)
-                        for v in obj.values():
-                            _deep_strip_cache_control(v)
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            _deep_strip_cache_control(item)
-
-                _deep_strip_cache_control(data)
+                # DISABLED: Preserving cache_control for prompt caching support
+                # def _deep_strip_cache_control(obj):
+                #     if isinstance(obj, dict):
+                #         obj.pop("cache_control", None)
+                #         for v in obj.values():
+                #             _deep_strip_cache_control(v)
+                #     elif isinstance(obj, list):
+                #         for item in obj:
+                #             _deep_strip_cache_control(item)
+                #
+                # _deep_strip_cache_control(data)
+                print(f"[{label}] RELAY: cache_control is being preserved for prompt caching")
 
                 print(
                     f"[{label}] RELAY: Using client data — "
@@ -805,31 +808,8 @@ def modify_opus_request(flow: http.HTTPFlow, label: str) -> None:
                     f"[{label}] RELAY: Keeping {len(data.get('system', []))} system blocks as-is"
                 )
 
-                # Strip ttl from cache_control (Bedrock only accepts {"type": "ephemeral"})
-                def _strip_ttl(obj):
-                    if isinstance(obj, dict):
-                        cc = obj.get("cache_control")
-                        if isinstance(cc, dict) and "ttl" in cc:
-                            del cc["ttl"]
-                        for v in obj.values():
-                            _strip_ttl(v)
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            _strip_ttl(item)
-
-                _strip_ttl(data)
-
-                # Strip cache_control from system/messages (causes 400 on Bedrock)
-                for block in data.get("system", []):
-                    if isinstance(block, dict) and "cache_control" in block:
-                        del block["cache_control"]
-                for msg in data.get("messages", []):
-                    content = msg.get("content", [])
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and "cache_control" in block:
-                                del block["cache_control"]
-                print(f"[{label}] RELAY: Stripped cache_control/ttl")
+                # Preserve cache_control with ttl for prompt caching
+                print(f"[{label}] RELAY: Preserving cache_control (1h TTL) for prompt caching")
 
                 # Merge original RovoDev tools into relay tools.
                 # The Atlassian gateway REQUIRES standard RovoDev tool names
@@ -992,25 +972,37 @@ def modify_opus_request(flow: http.HTTPFlow, label: str) -> None:
             )
 
             # Keep client's tools (already sanitized above) — do NOT replace with _original_body tools
+            # Force ALL cache_control to 1h — overwrite any residual 5m markers
+            _1h_cache = {"type": "ephemeral", "ttl": "1h"}
             tools = data.get("tools", [])
+            for t in tools:
+                if isinstance(t, dict) and "cache_control" in t:
+                    t["cache_control"] = _1h_cache
             if tools:
-                tools[-1].setdefault("cache_control", {"type": "ephemeral"})
-            print(f"[{label}] RELAY: Keeping client tools ({len(tools)})")
+                tools[-1]["cache_control"] = _1h_cache
+            print(f"[{label}] RELAY: Keeping client tools ({len(tools)}) — all cache_control set to 1h")
 
-            # Keep full Amp system prompt as-is, just add cache_control
+            # Keep full Amp system prompt as-is, force 1h cache_control
             sys_blocks = data.get("system")
             if isinstance(sys_blocks, list) and sys_blocks:
-                sys_blocks[0].setdefault("cache_control", {"type": "ephemeral"})
+                for sb in sys_blocks:
+                    if isinstance(sb, dict) and "cache_control" in sb:
+                        sb["cache_control"] = _1h_cache
+                sys_blocks[-1]["cache_control"] = _1h_cache
 
             # last message content block cache_control
             msgs = data.get("messages", [])
+            for msg in msgs:
+                c = msg.get("content")
+                if isinstance(c, list):
+                    for blk in c:
+                        if isinstance(blk, dict) and "cache_control" in blk:
+                            blk["cache_control"] = _1h_cache
             if msgs:
                 last_msg = msgs[-1]
                 content_blocks = last_msg.get("content")
                 if isinstance(content_blocks, list) and content_blocks:
-                    content_blocks[-1].setdefault(
-                        "cache_control", {"type": "ephemeral"}
-                    )
+                    content_blocks[-1]["cache_control"] = _1h_cache
 
             print(
                 f"[{label}] RELAY: Tools={len(data.get('tools', []))}, cache_control set"
