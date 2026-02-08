@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Conversations — RovoDev{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h1>Conversations</h1>
+    <a href="{{ url_for('conversation_create') }}" class="btn btn-primary">New Conversation</a>
+</div>
+
+{% if conversations %}
+<table class="table">
+    <thead>
+        <tr>
+            <th>Title</th>
+            <th>Model</th>
+            <th>Status</th>
+            <th>Messages</th>
+            <th>Created</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for conv in conversations %}
+        <tr>
+            <td><a href="{{ url_for('conversation_detail', conv_id=conv.id) }}">{{ conv.title }}</a></td>
+            <td>{{ conv.model }}</td>
+            <td><span class="badge {{ conv.status }}">{{ conv.status }}</span></td>
+            <td>{{ conv.messages|length }}</td>
+            <td>{{ conv.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td class="actions">
+                <a href="{{ url_for('conversation_edit', conv_id=conv.id) }}" class="btn btn-sm">Edit</a>
+                <form method="POST" action="{{ url_for('conversation_delete', conv_id=conv.id) }}" class="inline"
+                      onsubmit="return confirm('Delete this conversation?')">
+                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty">No conversations yet.</p>
+{% endif %}
+{% endblock %}

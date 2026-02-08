@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}RovoDev Dashboard{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <nav class="navbar">
+        <a href="{{ url_for('index') }}" class="nav-brand">RovoDev</a>
+        <div class="nav-links">
+            <a href="{{ url_for('conversations_list') }}">Conversations</a>
+            <a href="{{ url_for('prompts_list') }}">Prompts</a>
+            <a href="{{ url_for('settings_page') }}">Settings</a>
+            <a href="{{ url_for('files_list') }}">Files</a>
+            <a href="{{ url_for('health') }}">Health</a>
+        </div>
+    </nav>
+
+    <main class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        {% for category, message in messages %}
+        <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+        {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+        <p>RovoDev Dashboard &mdash; Azure Cloud Application</p>
+    </footer>
+</body>
+</html>

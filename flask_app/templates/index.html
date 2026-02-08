@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — RovoDev{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.conversations }}</span>
+        <span class="stat-label">Conversations</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.messages }}</span>
+        <span class="stat-label">Messages</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.prompts }}</span>
+        <span class="stat-label">System Prompts</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.files }}</span>
+        <span class="stat-label">Files</span>
+    </div>
+</div>
+
+<h2>Recent Conversations</h2>
+{% if recent %}
+<table class="table">
+    <thead>
+        <tr>
+            <th>Title</th>
+            <th>Model</th>
+            <th>Status</th>
+            <th>Messages</th>
+            <th>Updated</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for conv in recent %}
+        <tr>
+            <td><a href="{{ url_for('conversation_detail', conv_id=conv.id) }}">{{ conv.title }}</a></td>
+            <td>{{ conv.model }}</td>
+            <td><span class="badge {{ conv.status }}">{{ conv.status }}</span></td>
+            <td>{{ conv.messages|length }}</td>
+            <td>{{ conv.updated_at.strftime('%Y-%m-%d %H:%M') }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="empty">No conversations yet. <a href="{{ url_for('conversation_create') }}">Create one</a>.</p>
+{% endif %}
+{% endblock %}

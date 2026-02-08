@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}System Prompts — RovoDev{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h1>System Prompts</h1>
+    <a href="{{ url_for('prompt_create') }}" class="btn btn-primary">New Prompt</a>
+</div>
+
+{% if prompts %}
+<div class="card-grid">
+    {% for prompt in prompts %}
+    <div class="card {{ 'card-active' if prompt.is_active }}">
+        <div class="card-header">
+            <h3>{{ prompt.name }}</h3>
+            {% if prompt.is_active %}<span class="badge active">Active</span>{% endif %}
+        </div>
+        <p class="card-body">{{ prompt.content[:200] }}{{ '...' if prompt.content|length > 200 }}</p>
+        <div class="card-footer">
+            <span class="meta">Updated {{ prompt.updated_at.strftime('%Y-%m-%d') }}</span>
+            <div class="actions">
+                <a href="{{ url_for('prompt_edit', prompt_id=prompt.id) }}" class="btn btn-sm">Edit</a>
+                <form method="POST" action="{{ url_for('prompt_delete', prompt_id=prompt.id) }}" class="inline"
+                      onsubmit="return confirm('Delete this prompt?')">
+                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                </form>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<p class="empty">No system prompts yet.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Settings — RovoDev{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+
+<form method="POST" action="{{ url_for('settings_page') }}">
+    <table class="table">
+        <thead>
+            <tr>
+                <th>Key</th>
+                <th>Value</th>
+                <th>Description</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in settings %}
+            <tr>
+                <td><code>{{ s.key }}</code></td>
+                <td><input type="text" name="setting_{{ s.id }}" value="{{ s.value }}"></td>
+                <td class="meta">{{ s.description }}</td>
+                <td>
+                    <form method="POST" action="{{ url_for('setting_delete', setting_id=s.id) }}" class="inline"
+                          onsubmit="return confirm('Delete this setting?')">
+                        <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <button type="submit" class="btn btn-primary">Save All</button>
+</form>
+
+<h3>Add Setting</h3>
+<form method="POST" action="{{ url_for('setting_create') }}" class="form-inline">
+    <input type="text" name="key" placeholder="Key" required>
+    <input type="text" name="value" placeholder="Value">
+    <input type="text" name="description" placeholder="Description">
+    <button type="submit" class="btn btn-primary">Add</button>
+</form>
+{% endblock %}

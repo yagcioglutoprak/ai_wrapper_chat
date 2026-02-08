@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ "Edit" if conversation else "New" }} Conversation — RovoDev{% endblock %}
+{% block content %}
+<h1>{{ "Edit" if conversation else "New" }} Conversation</h1>
+
+<form method="POST" action="{{ url_for('conversation_edit', conv_id=conversation.id) if conversation else url_for('conversation_create') }}">
+    <div class="form-group">
+        <label for="title">Title</label>
+        <input type="text" id="title" name="title" value="{{ conversation.title if conversation else '' }}" required>
+    </div>
+    <div class="form-group">
+        <label for="model">Model</label>
+        <select id="model" name="model">
+            <option value="claude-opus-4-6" {{ 'selected' if not conversation or conversation.model == 'claude-opus-4-6' }}>Claude Opus 4.6</option>
+            <option value="claude-sonnet-4" {{ 'selected' if conversation and conversation.model == 'claude-sonnet-4' }}>Claude Sonnet 4</option>
+            <option value="claude-haiku-3.5" {{ 'selected' if conversation and conversation.model == 'claude-haiku-3.5' }}>Claude Haiku 3.5</option>
+        </select>
+    </div>
+    {% if conversation %}
+    <div class="form-group">
+        <label for="status">Status</label>
+        <select id="status" name="status">
+            <option value="active" {{ 'selected' if conversation.status == 'active' }}>Active</option>
+            <option value="archived" {{ 'selected' if conversation.status == 'archived' }}>Archived</option>
+            <option value="completed" {{ 'selected' if conversation.status == 'completed' }}>Completed</option>
+        </select>
+    </div>
+    {% endif %}
+    <button type="submit" class="btn btn-primary">{{ "Update" if conversation else "Create" }}</button>
+    <a href="{{ url_for('conversations_list') }}" class="btn">Cancel</a>
+</form>
+{% endblock %}

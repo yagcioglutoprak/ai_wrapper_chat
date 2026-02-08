@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}{{ "Edit" if prompt else "New" }} Prompt — RovoDev{% endblock %}
+{% block content %}
+<h1>{{ "Edit" if prompt else "New" }} System Prompt</h1>
+
+<form method="POST" action="{{ url_for('prompt_edit', prompt_id=prompt.id) if prompt else url_for('prompt_create') }}">
+    <div class="form-group">
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" value="{{ prompt.name if prompt else '' }}" required>
+    </div>
+    <div class="form-group">
+        <label for="content">Content</label>
+        <textarea id="content" name="content" rows="12" required>{{ prompt.content if prompt else '' }}</textarea>
+    </div>
+    <div class="form-group checkbox">
+        <label>
+            <input type="checkbox" name="is_active" {{ 'checked' if prompt and prompt.is_active }}>
+            Set as active prompt
+        </label>
+    </div>
+    <button type="submit" class="btn btn-primary">{{ "Update" if prompt else "Create" }}</button>
+    <a href="{{ url_for('prompts_list') }}" class="btn">Cancel</a>
+</form>
+{% endblock %}
