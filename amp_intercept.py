@@ -97,15 +97,44 @@ def _zero_tokens_and_costs(obj, depth=0) -> bool:
 # SSE STREAMING TRANSFORMER — zeroes usage in-flight without buffering
 # =============================================================================
 
+_ZERO_USAGE = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+}
+
+
 class SSEUsageZeroer:
     """Line-buffered SSE transformer that zeroes token/cost fields in-flight.
 
     Assigned to flow.response.stream so mitmproxy calls it for each chunk.
     Works with arbitrary chunk boundaries (chunks may split mid-line).
+
+    Also ensures that message_start and message_delta events always carry a
+    ``usage`` object so the downstream client never crashes on
+    ``D.usage.input_tokens`` being undefined.
     """
 
     def __init__(self):
         self._buf = ""
+
+    @staticmethod
+    def _ensure_usage(evt: dict) -> None:
+        evt_type = evt.get("type")
+        if evt_type == "message_start":
+            msg = evt.get("message")
+            if isinstance(msg, dict):
+                if "usage" not in msg or not isinstance(msg.get("usage"), dict):
+                    msg["usage"] = dict(_ZERO_USAGE)
+                else:
+                    for k, v in _ZERO_USAGE.items():
+                        msg["usage"].setdefault(k, v)
+        elif evt_type == "message_delta":
+            if "usage" not in evt or not isinstance(evt.get("usage"), dict):
+                evt["usage"] = {"output_tokens": 0}
+            else:
+                evt["usage"].setdefault("output_tokens", 0)
 
     def __call__(self, chunk: bytes) -> bytes:
         if not chunk:
@@ -121,8 +150,9 @@ class SSEUsageZeroer:
                 data_str = stripped[6:]
                 try:
                     evt = json.loads(data_str)
-                    if _zero_tokens_and_costs(evt):
-                        line = f"data: {json.dumps(evt)}"
+                    _zero_tokens_and_costs(evt)
+                    self._ensure_usage(evt)
+                    line = f"data: {json.dumps(evt)}"
                 except (json.JSONDecodeError, TypeError):
                     pass
             out.append(line + "\n")
