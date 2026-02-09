@@ -861,7 +861,8 @@ def _run_and_capture(
 
 
 def _fix_sse_events(raw: bytes) -> bytes:
-    """Inject missing `event:` lines and proper SSE formatting.
+    """Inject missing `event:` lines, zero tokens, ensure usage, and
+    apply proper SSE formatting.
 
     The raw Vertex response only has `data:` lines.  The Anthropic Python SDK
     requires `event: <type>\\n` before each `data:` line and a blank line
@@ -872,27 +873,26 @@ def _fix_sse_events(raw: bytes) -> bytes:
     for line in lines:
         stripped = line.strip()
 
-        # Pass through blank lines and non-data lines
         if not stripped:
             out.append("")
             continue
 
         if stripped.startswith("data: "):
             data_str = stripped[6:].strip()
-            # Try to extract event type from JSON
             try:
                 evt = json.loads(data_str)
                 evt_type = evt.get("type")
                 if evt_type:
                     out.append(f"event: {evt_type}")
+                _zero_tokens(evt)
+                _ensure_usage(evt)
+                out.append(f"data: {json.dumps(evt)}")
             except (json.JSONDecodeError, AttributeError, TypeError):
-                pass
-            out.append(stripped)
+                out.append(stripped)
             out.append("")  # Blank line terminates SSE event
         else:
             out.append(line)
 
-    # Ensure stream ends cleanly
     return "\n".join(out).encode("utf-8")
 
 
@@ -1000,6 +1000,55 @@ KEEPALIVE_INTERVAL = 5  # seconds between SSE keepalive comments
 STREAM_POLL_INTERVAL = 0.1  # seconds between stream file checks
 
 
+_ZERO_USAGE = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+}
+
+
+def _ensure_usage(evt: dict) -> None:
+    """Guarantee that message_start and message_delta SSE events always
+    carry a ``usage`` object so the downstream client never crashes on
+    ``D.usage.input_tokens`` being undefined."""
+    evt_type = evt.get("type")
+    if evt_type == "message_start":
+        msg = evt.get("message")
+        if isinstance(msg, dict):
+            if "usage" not in msg or not isinstance(msg.get("usage"), dict):
+                msg["usage"] = dict(_ZERO_USAGE)
+            else:
+                for k, v in _ZERO_USAGE.items():
+                    msg["usage"].setdefault(k, v)
+    elif evt_type == "message_delta":
+        if "usage" not in evt or not isinstance(evt.get("usage"), dict):
+            evt["usage"] = {"output_tokens": 0}
+        else:
+            evt["usage"].setdefault("output_tokens", 0)
+
+
+def _zero_tokens(evt: dict, depth: int = 0) -> None:
+    """Recursively zero all token/cost fields in an SSE event."""
+    if depth > 20:
+        return
+    _TOKEN_KEYS = {
+        "input_tokens", "output_tokens", "total_tokens",
+        "cache_creation_input_tokens", "cache_read_input_tokens",
+        "ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens",
+    }
+    if isinstance(evt, dict):
+        for k in list(evt.keys()):
+            if k in _TOKEN_KEYS:
+                evt[k] = 0
+            elif isinstance(evt[k], dict):
+                _zero_tokens(evt[k], depth + 1)
+            elif isinstance(evt[k], list):
+                for item in evt[k]:
+                    if isinstance(item, dict):
+                        _zero_tokens(item, depth + 1)
+
+
 class SSEStreamFixer:
     """Buffer partial SSE lines and emit properly formatted events.
 
@@ -1007,6 +1056,9 @@ class SSEStreamFixer:
     requires ``event: <type>`` before each ``data:`` line and a blank line
     after.  This class processes data incrementally (line-buffered) so it
     works with streaming chunks that may split across line boundaries.
+
+    Also zeroes all token counts and ensures ``usage`` is always present
+    on ``message_start`` and ``message_delta`` events.
     """
 
     def __init__(self):
@@ -1029,9 +1081,11 @@ class SSEStreamFixer:
                     evt_type = evt.get("type")
                     if evt_type:
                         output.append(f"event: {evt_type}\n")
+                    _zero_tokens(evt)
+                    _ensure_usage(evt)
+                    output.append(f"data: {json.dumps(evt)}\n")
                 except (json.JSONDecodeError, AttributeError, TypeError):
-                    pass
-                output.append(stripped + "\n")
+                    output.append(stripped + "\n")
                 output.append("\n")  # Blank line terminates SSE event
             else:
                 output.append(line + "\n")
