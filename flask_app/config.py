@@ -26,7 +26,8 @@ class Config:
         "AZURE_STORAGE_CONTAINER", "app-files"
     )
 
-    # AI API server (Anthropic-compatible API)
+    # AI API server — set API_SERVER_URL env var to point to your
+    # Anthropic-compatible API backend running locally
     API_SERVER_URL = os.environ.get("API_SERVER_URL", "http://127.0.0.1:8000")
 
     # Local file upload fallback
