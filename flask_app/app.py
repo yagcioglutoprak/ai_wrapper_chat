@@ -1,4 +1,4 @@
-"""RovoDev Dashboard — Flask application.
+"""AI Chat Dashboard — Flask application.
 
 A web dashboard for managing conversations, system prompts, settings,
 and files. Uses SQLAlchemy (SQLite locally, PostgreSQL on Azure) and
@@ -13,11 +13,15 @@ Environment variables (see .env.example):
     SECRET_KEY                        — Flask secret key
 """
 
+import json
 import os
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 from flask import (
     Flask,
+    Response as FlaskResponse,
     abort,
     flash,
     jsonify,
@@ -52,9 +56,8 @@ def _seed_defaults():
     """Insert default settings if the table is empty."""
     if Setting.query.count() == 0:
         defaults = [
-            ("model", "claude-opus-4-6", "Default AI model"),
+            ("model", "claude-sonnet-4-20250514", "Default AI model"),
             ("max_tokens", "8192", "Maximum tokens per response"),
-            ("proxy_url", "http://127.0.0.1:8080", "Mitmproxy URL"),
             ("rate_limit_cooldown", "60", "Rate limit cooldown in seconds"),
         ]
         for key, value, desc in defaults:
@@ -105,7 +108,7 @@ def conversation_create():
     if request.method == "POST":
         conv = Conversation(
             title=request.form.get("title", "New Conversation"),
-            model=request.form.get("model", "claude-opus-4-6"),
+            model=request.form.get("model", "claude-sonnet-4-20250514"),
         )
         db.session.add(conv)
         db.session.commit()
@@ -343,7 +346,7 @@ def api_conversations():
         data = request.get_json(silent=True) or {}
         conv = Conversation(
             title=data.get("title", "API Conversation"),
-            model=data.get("model", "claude-opus-4-6"),
+            model=data.get("model", "claude-sonnet-4-20250514"),
             status=data.get("status", "active"),
         )
         db.session.add(conv)
@@ -387,6 +390,194 @@ def api_prompts():
 def api_settings():
     settings = Setting.query.all()
     return jsonify([s.to_dict() for s in settings])
+
+
+# ── Chat ─────────────────────────────────────────────────────────────────────
+
+
+@app.route("/chat")
+def chat_page():
+    conversation_id = request.args.get("conversation_id", type=int)
+    conversations = Conversation.query.order_by(Conversation.updated_at.desc()).all()
+
+    messages = []
+    active_conv = None
+    if conversation_id:
+        active_conv = Conversation.query.get(conversation_id)
+        if active_conv:
+            messages = (
+                Message.query.filter_by(conversation_id=conversation_id)
+                .order_by(Message.created_at)
+                .all()
+            )
+
+    return render_template(
+        "chat.html",
+        conversations=conversations,
+        messages=messages,
+        active_conv=active_conv,
+        conversation_id=conversation_id,
+    )
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    data = request.get_json(silent=True) or {}
+    prompt = data.get("prompt", "").strip()
+    if not prompt:
+        return jsonify({"error": "prompt is required"}), 400
+
+    conversation_id = data.get("conversation_id")
+    system_prompt_text = data.get("system_prompt")
+
+    if conversation_id:
+        conv = Conversation.query.get(conversation_id)
+        if not conv:
+            return jsonify({"error": "Conversation not found"}), 404
+    else:
+        conv = Conversation(
+            title=prompt[:80],
+            model="claude-sonnet-4-20250514",
+        )
+        db.session.add(conv)
+        db.session.commit()
+
+    user_msg = Message(
+        conversation_id=conv.id,
+        role="user",
+        content=prompt,
+        token_count=len(prompt) // 4,
+    )
+    db.session.add(user_msg)
+    conv.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+
+    if system_prompt_text is None:
+        active_prompt = SystemPrompt.query.filter_by(is_active=True).first()
+        system_prompt_text = active_prompt.content if active_prompt else ""
+
+    all_msgs = (
+        Message.query.filter_by(conversation_id=conv.id)
+        .order_by(Message.created_at)
+        .all()
+    )
+    api_messages = [
+        {"role": m.role, "content": m.content}
+        for m in all_msgs
+        if m.role in ("user", "assistant")
+    ]
+
+    model_setting = Setting.query.filter_by(key="model").first()
+    model_name = model_setting.value if model_setting else "claude-sonnet-4-20250514"
+
+    payload = {
+        "model": model_name,
+        "max_tokens": 16000,
+        "stream": True,
+        "messages": api_messages,
+        "thinking": {"type": "adaptive"},
+    }
+    if system_prompt_text:
+        payload["system"] = system_prompt_text
+
+    server_url = app.config["API_SERVER_URL"].rstrip("/")
+    url = f"{server_url}/v1/messages"
+
+    conv_id = conv.id
+
+    def generate():
+        yield f"data: {json.dumps({'type': 'meta', 'conversation_id': conv_id})}\n\n"
+        try:
+            req_obj = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req_obj, timeout=300)
+
+            buf = ""
+            while True:
+                chunk = resp.read(1024)
+                if not chunk:
+                    break
+                buf += chunk.decode("utf-8", errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data: "):
+                        raw = line[6:].strip()
+                        try:
+                            evt = json.loads(raw)
+                            evt_type = evt.get("type", "")
+                            if evt_type == "content_block_delta":
+                                delta = evt.get("delta", {})
+                                if delta.get("type") == "thinking_delta":
+                                    yield f"data: {json.dumps({'type': 'thinking', 'text': delta.get('thinking', '')})}\n\n"
+                                elif delta.get("type") == "text_delta":
+                                    yield f"data: {json.dumps({'type': 'text', 'text': delta.get('text', '')})}\n\n"
+                            elif evt_type == "content_block_start":
+                                block = evt.get("content_block", {})
+                                if block.get("type") == "thinking":
+                                    yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
+                                elif block.get("type") == "text":
+                                    yield f"data: {json.dumps({'type': 'text_start'})}\n\n"
+                            elif evt_type == "content_block_stop":
+                                yield f"data: {json.dumps({'type': 'block_stop'})}\n\n"
+                            elif evt_type == "message_stop":
+                                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            elif evt_type == "error":
+                                err_msg = evt.get("error", {}).get("message", "Unknown error")
+                                yield f"data: {json.dumps({'type': 'error', 'error': err_msg})}\n\n"
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    elif line.startswith(": keepalive"):
+                        pass
+            resp.close()
+        except urllib.error.URLError as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': f'Cannot reach API server: {e}'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': f'Request failed: {e}'})}\n\n"
+
+    return FlaskResponse(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route("/api/chat/save", methods=["POST"])
+def api_chat_save():
+    data = request.get_json(silent=True) or {}
+    conv_id = data.get("conversation_id")
+    content = data.get("content", "")
+    if not conv_id or not content:
+        return jsonify({"error": "conversation_id and content required"}), 400
+
+    conv = Conversation.query.get(conv_id)
+    if not conv:
+        return jsonify({"error": "Conversation not found"}), 404
+
+    last_msg = (
+        Message.query.filter_by(conversation_id=conv.id)
+        .order_by(Message.created_at.desc())
+        .first()
+    )
+    if last_msg and last_msg.role == "assistant" and last_msg.content == content:
+        return jsonify({"id": last_msg.id})
+
+    msg = Message(
+        conversation_id=conv.id,
+        role="assistant",
+        content=content,
+        token_count=len(content) // 4,
+    )
+    db.session.add(msg)
+    conv.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify({"id": msg.id})
 
 
 # ── Health Check ─────────────────────────────────────────────────────────────

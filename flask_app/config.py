@@ -14,7 +14,7 @@ class Config:
 
     # Database — SQLite locally, PostgreSQL on Azure
     SQLALCHEMY_DATABASE_URI = os.environ.get(
-        "DATABASE_URL", "sqlite:///rovodev.db"
+        "DATABASE_URL", "sqlite:///dashboard.db"
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
@@ -23,8 +23,11 @@ class Config:
         "AZURE_STORAGE_CONNECTION_STRING", ""
     )
     AZURE_STORAGE_CONTAINER = os.environ.get(
-        "AZURE_STORAGE_CONTAINER", "rovodev-files"
+        "AZURE_STORAGE_CONTAINER", "app-files"
     )
+
+    # AI API server (Anthropic-compatible API)
+    API_SERVER_URL = os.environ.get("API_SERVER_URL", "http://127.0.0.1:8000")
 
     # Local file upload fallback
     UPLOAD_FOLDER = os.environ.get(

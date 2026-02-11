@@ -1,4 +1,4 @@
-"""SQLAlchemy models for RovoDev Dashboard.
+"""SQLAlchemy models for AI Chat Dashboard.
 
 Works with SQLite (local) and PostgreSQL (Azure) via DATABASE_URL.
 """
@@ -15,7 +15,7 @@ class Conversation(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(256), nullable=False, default="New Conversation")
-    model = db.Column(db.String(64), nullable=False, default="claude-opus-4-6")
+    model = db.Column(db.String(64), nullable=False, default="claude-sonnet-4-20250514")
     status = db.Column(db.String(32), nullable=False, default="active")
     created_at = db.Column(
         db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc)

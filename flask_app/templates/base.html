@@ -3,13 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}RovoDev Dashboard{% endblock %}</title>
+    <title>{% block title %}AI Chat Dashboard{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 </head>
 <body>
     <nav class="navbar">
-        <a href="{{ url_for('index') }}" class="nav-brand">RovoDev</a>
+        <a href="{{ url_for('index') }}" class="nav-brand">AI Chat</a>
         <div class="nav-links">
+            <a href="{{ url_for('chat_page') }}">Chat</a>
             <a href="{{ url_for('conversations_list') }}">Conversations</a>
             <a href="{{ url_for('prompts_list') }}">Prompts</a>
             <a href="{{ url_for('settings_page') }}">Settings</a>
@@ -31,7 +35,7 @@
     </main>
 
     <footer class="footer">
-        <p>RovoDev Dashboard &mdash; Azure Cloud Application</p>
+        <p>AI Chat Dashboard &mdash; Azure Cloud Application</p>
     </footer>
 </body>
 </html>

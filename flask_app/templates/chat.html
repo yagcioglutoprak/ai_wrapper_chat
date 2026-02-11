@@ -1,0 +1,284 @@
+{% extends "base.html" %}
+{% block title %}Chat — AI Chat Dashboard{% endblock %}
+{% block content %}
+<div class="chat-layout">
+    <aside class="chat-sidebar">
+        <div class="sidebar-top">
+            <a href="{{ url_for('chat_page') }}" class="sidebar-item sidebar-new">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+                New chat
+            </a>
+        </div>
+        {% if conversations %}
+        <div class="sidebar-label">Recent</div>
+        {% endif %}
+        <div class="conv-list">
+            {% for conv in conversations %}
+            <a href="{{ url_for('chat_page', conversation_id=conv.id) }}"
+               class="sidebar-item {% if conversation_id == conv.id %}active{% endif %}">
+                <span class="conv-title">{{ conv.title }}</span>
+            </a>
+            {% endfor %}
+        </div>
+    </aside>
+
+    <div class="chat-main">
+        <div class="chat-scroll" id="chatMessages">
+            {% if messages %}
+            <div class="chat-thread">
+                {% for msg in messages %}
+                {% if msg.role == 'user' %}
+                <div class="msg-row msg-user">
+                    <div class="msg-pill">{{ msg.content }}</div>
+                </div>
+                {% else %}
+                <div class="msg-row msg-assistant">
+                    <div class="msg-text md-content" data-raw="{{ msg.content|e }}"></div>
+                </div>
+                {% endif %}
+                {% endfor %}
+            </div>
+            {% else %}
+            <div class="chat-welcome" id="chatEmpty">
+                <div class="welcome-star">✸</div>
+                <h1>Hello, there.</h1>
+                <p>How can I help you today?</p>
+            </div>
+            {% endif %}
+        </div>
+
+        <div class="chat-input-area">
+            <div class="chat-input-card">
+                <form id="chatForm">
+                    <textarea id="chatInput" placeholder="Reply..." rows="1"></textarea>
+                    <div class="input-footer">
+                        <span class="input-model">Opus 4.6</span>
+                        <button type="submit" class="send-btn" id="chatSend" title="Send">
+                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 13V3l11 5-11 5z" fill="currentColor"/></svg>
+                        </button>
+                    </div>
+                </form>
+            </div>
+            <div class="input-disclaimer">AI can make mistakes. Please verify responses.</div>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+    marked.setOptions({
+        highlight: function(code, lang) {
+            if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
+            return hljs.highlightAuto(code).value;
+        },
+        breaks: false, gfm: true,
+    });
+
+    function renderMd(text) { return marked.parse(text); }
+
+    document.querySelectorAll('.md-content[data-raw]').forEach(function(el) {
+        var raw = el.getAttribute('data-raw');
+        if (raw) {
+            var decoded = raw.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#x27;/g,"'").replace(/&#39;/g,"'");
+            el.innerHTML = renderMd(decoded);
+        }
+    });
+
+    var form = document.getElementById('chatForm');
+    var input = document.getElementById('chatInput');
+    var messagesEl = document.getElementById('chatMessages');
+    var sendBtn = document.getElementById('chatSend');
+    var conversationId = {{ conversation_id|tojson }};
+    var streaming = false;
+    var saving = false;
+    var mdTimer = null;
+
+    function debounceMd(el, text) {
+        if (mdTimer) clearTimeout(mdTimer);
+        mdTimer = setTimeout(function() { el.innerHTML = renderMd(text); scrollBottom(); }, 50);
+    }
+
+    input.addEventListener('input', function() {
+        this.style.height = 'auto';
+        this.style.height = Math.min(this.scrollHeight, 180) + 'px';
+    });
+    input.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.dispatchEvent(new Event('submit')); }
+    });
+
+    function scrollBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
+    scrollBottom();
+
+    function getThread() {
+        var t = messagesEl.querySelector('.chat-thread');
+        if (!t) {
+            var empty = document.getElementById('chatEmpty');
+            if (empty) empty.remove();
+            t = document.createElement('div');
+            t.className = 'chat-thread';
+            messagesEl.appendChild(t);
+        }
+        return t;
+    }
+
+    function addUserMsg(text) {
+        var row = document.createElement('div');
+        row.className = 'msg-row msg-user';
+        var pill = document.createElement('div');
+        pill.className = 'msg-pill';
+        pill.textContent = text;
+        row.appendChild(pill);
+        getThread().appendChild(row);
+        scrollBottom();
+    }
+
+    function addLoadingIndicator() {
+        var row = document.createElement('div');
+        row.className = 'msg-row msg-assistant';
+        row.id = 'loadingRow';
+        row.innerHTML =
+            '<div class="loading-indicator">' +
+                '<div class="loading-dots"><span></span><span></span><span></span></div>' +
+                '<div class="loading-shimmer"></div>' +
+            '</div>';
+        getThread().appendChild(row);
+        scrollBottom();
+        return row;
+    }
+
+    function removeLoadingIndicator() {
+        var el = document.getElementById('loadingRow');
+        if (el) el.remove();
+    }
+
+    function addAssistantMsg() {
+        removeLoadingIndicator();
+        var row = document.createElement('div');
+        row.className = 'msg-row msg-assistant';
+        row.id = 'streamRow';
+        row.innerHTML =
+            '<div class="msg-stream-wrap">' +
+                '<div class="thinking-block" style="display:none">' +
+                    '<div class="thinking-label">' +
+                        '<span class="thinking-dot"></span>Thinking' +
+                        '<button class="thinking-chevron" type="button" onclick="this.closest(\'.thinking-block\').classList.toggle(\'collapsed\')">' +
+                            '<svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 4l2.5 2.5L7.5 4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+                        '</button>' +
+                    '</div>' +
+                    '<div class="thinking-content"></div>' +
+                '</div>' +
+                '<div class="msg-text md-content"></div>' +
+            '</div>';
+        getThread().appendChild(row);
+        scrollBottom();
+        return row;
+    }
+
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        if (streaming) return;
+        var prompt = input.value.trim();
+        if (!prompt) return;
+
+        input.value = '';
+        input.style.height = 'auto';
+        streaming = true;
+        sendBtn.disabled = true;
+
+        addUserMsg(prompt);
+        addLoadingIndicator();
+
+        var row = null, thinkBlock = null, thinkContent = null, textEl = null;
+        var fullText = '', fullThink = '', inThink = false;
+        var firstEvent = true;
+
+        function ensureRow() {
+            if (!row) {
+                row = addAssistantMsg();
+                thinkBlock = row.querySelector('.thinking-block');
+                thinkContent = row.querySelector('.thinking-content');
+                textEl = row.querySelector('.msg-text');
+            }
+        }
+
+        try {
+            var resp = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ prompt: prompt, conversation_id: conversationId }),
+            });
+            var reader = resp.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = '';
+
+            while (true) {
+                var result = await reader.read();
+                if (result.done) break;
+                buf += decoder.decode(result.value, { stream: true });
+                var lines = buf.split('\n');
+                buf = lines.pop();
+
+                for (var i = 0; i < lines.length; i++) {
+                    var ln = lines[i].trim();
+                    if (!ln || !ln.startsWith('data: ')) continue;
+                    var evt;
+                    try { evt = JSON.parse(ln.slice(6)); } catch(x) { continue; }
+
+                    if (evt.type === 'meta' && !conversationId && evt.conversation_id) {
+                        conversationId = evt.conversation_id;
+                        history.replaceState(null, '', '/chat?conversation_id=' + conversationId);
+                    } else if (evt.type === 'thinking_start') {
+                        ensureRow();
+                        inThink = true;
+                        thinkBlock.style.display = '';
+                    } else if (evt.type === 'thinking') {
+                        ensureRow();
+                        fullThink += evt.text;
+                        thinkContent.textContent = fullThink;
+                        scrollBottom();
+                    } else if (evt.type === 'text_start') {
+                        ensureRow();
+                        if (inThink) {
+                            inThink = false;
+                            thinkBlock.classList.add('done', 'collapsed');
+                        }
+                    } else if (evt.type === 'text') {
+                        ensureRow();
+                        fullText += evt.text;
+                        debounceMd(textEl, fullText);
+                    } else if (evt.type === 'block_stop' && inThink) {
+                        inThink = false;
+                        thinkBlock.classList.add('done');
+                    } else if (evt.type === 'error') {
+                        ensureRow();
+                        textEl.innerHTML = '<span class="msg-error">' + evt.error + '</span>';
+                    } else if (evt.type === 'done' && fullText) {
+                        ensureRow();
+                        textEl.innerHTML = renderMd(fullText);
+                    }
+                }
+            }
+
+            if (fullText) { ensureRow(); textEl.innerHTML = renderMd(fullText); }
+            if (conversationId && fullText && !saving) {
+                saving = true;
+                fetch('/api/chat/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ conversation_id: conversationId, content: fullText }),
+                }).finally(function() { saving = false; });
+            }
+        } catch (err) {
+            ensureRow();
+            textEl.innerHTML = '<span class="msg-error">Could not reach the server.</span>';
+        }
+        removeLoadingIndicator();
+
+        if (row) row.removeAttribute('id');
+        streaming = false;
+        sendBtn.disabled = false;
+        input.focus();
+    });
+})();
+</script>
+{% endblock %}
